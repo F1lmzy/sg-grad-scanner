@@ -1,0 +1,22 @@
+# --- Python / runtime ---
+__pycache__/
+*.pyc
+node_modules/
+*.log
+
+# --- Scratch data dumps (report/print artifacts, not source) ---
+*.html
+*.json
+*.txt
+*.bak
+seen_ids.json
+tracked_ids*.txt
+candidates.json
+careers_registry.json
+*/output/
+*.svg
+*.png
+
+# --- Scratch / wrappers that were one-off probes ---
+scratch/
+/tmp/
