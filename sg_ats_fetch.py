@@ -11,10 +11,25 @@ Strategy (user is a foreigner — cannot apply via MyCareersFuture):
      infrastructure (gh/lv/wb/ashby/smartrecruiters APIs) so output links point
      at the COMPANY'S OWN portal, not an aggregator.
 
-Output JSON: {curated_new, curated_all, mcf_leads, resolved, errors}
+Output JSON includes recurring direct-board results, LinkedIn/MCF company leads,
+registered lead verification targets, unresolved companies, and due registered
+portals for browser checks.
 Dedup state: ~/jobscan/seen_ids.json
 """
-import json, re, os, time, html as html_mod, urllib.request, urllib.parse, concurrent.futures as cf
+import concurrent.futures as cf
+import fcntl
+import html as html_mod
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+
+import careers_registry as cr
 
 STATE = os.path.expanduser('~/jobscan/seen_ids.json')
 UA = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'}
@@ -27,7 +42,12 @@ GREENHOUSE_BOARDS = [
 LEVER_COMPANIES = ['ninjavan']
 WORKABLE_ACCOUNTS = ['qcp-group', 'genesis']
 
-KEYWORDS = re.compile(r'graduate|entry.level|junior|associate|fresh|trainee|analyst program|academy|intern\b|internship', re.I)
+KEYWORDS = re.compile(r'graduate|entry.level|junior|associate|fresh|trainee|analyst program|academy', re.I)
+NON_FULL_TIME = re.compile(
+    r'\bintern(?:ship)?\b|\bco[- ]?op\b|\battachment\b|\bpart[- ]?time\b|'
+    r'\bcontract(?:or)?\b|\btemporary\b|\btemp\b|\bapprentice(?:ship)?\b|\bcasual\b',
+    re.I,
+)
 # LinkedIn search terms (guest API discovery) - distinct from the filter regex
 LI_QUERIES = [
     'graduate software engineer', 'graduate engineer', 'graduate program',
@@ -41,7 +61,10 @@ LI_QUERIES = [
     'cloud engineer', 'backend engineer', 'AI engineer', 'research engineer',
 ]
 DOMAINS = re.compile(r'software|engineer|developer|machine learning|\bml\b|\bai\b|data scien|quant|robotic|electrical|embedded|firmware|full.stack|backend|platform|infrastructure|devops|reliability|analytics', re.I)
-SG_HINT = re.compile(r'singapore|\bsg\b|\(sg\)|southeast asia|apac', re.I)
+SG_HINT = re.compile(r'singapore|\bsg\b|\(sg\)', re.I)
+
+def is_full_time_grad(title):
+    return bool(KEYWORDS.search(title or '')) and not bool(NON_FULL_TIME.search(title or ''))
 
 def get_json(url, data=None, extra=None):
     headers = dict(UA)
@@ -53,15 +76,51 @@ def get_json(url, data=None, extra=None):
 def norm(s):
     return re.sub(r'\s+', ' ', s or '').strip()
 
-def load_seen():
+@contextmanager
+def _seen_lock(exclusive):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE + '.lock', 'a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+
+def _load_seen_unlocked():
     try:
-        return set(json.load(open(STATE)))
-    except Exception:
+        with open(STATE) as handle:
+            return set(json.load(handle))
+    except FileNotFoundError:
         return set()
 
+def load_seen():
+    with _seen_lock(exclusive=False):
+        return _load_seen_unlocked()
+
+def _save_seen_unlocked(seen):
+    directory = os.path.dirname(STATE)
+    fd, temporary = tempfile.mkstemp(prefix='.seen-ids-', suffix='.json', dir=directory)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump(sorted(seen), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, STATE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
 def save_seen(seen):
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    json.dump(sorted(seen), open(STATE, 'w'))
+    with _seen_lock(exclusive=True):
+        _save_seen_unlocked(seen)
+
+def commit_seen_file(payload_path):
+    """Atomically merge acknowledged direct-job IDs from a JSON file."""
+    with open(payload_path) as handle:
+        ids = json.load(handle)
+    if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+        raise ValueError('seen-ID payload must be a JSON list of strings')
+    with _seen_lock(exclusive=True):
+        merged = _load_seen_unlocked() | set(ids)
+        _save_seen_unlocked(merged)
+    return len(merged)
 
 def slugify(name):
     s = re.sub(r'[^a-z0-9]+', '', name.lower())
@@ -74,16 +133,21 @@ def j_common(source, slug, jid, company, title, loc, url, updated):
         'company': company, 'title': title, 'location': loc, 'url': url,
         'updated': updated,
         'sg': bool(SG_HINT.search(loc)) or bool(SG_HINT.search(title)),
-        'grad': bool(KEYWORDS.search(title)),
+        'grad': is_full_time_grad(title),
         'domain': bool(DOMAINS.search(title)),
         'source': source,
     }
+
+def _require_jobs(payload, source):
+    if not isinstance(payload, dict) or not isinstance(payload.get('jobs'), list):
+        raise ValueError(f'{source} response is missing a jobs list')
+    return payload['jobs']
 
 def fetch_greenhouse(slug):
     d = get_json(f'https://boards-api.greenhouse.io/v1/boards/{slug}/jobs')
     return [j_common('greenhouse', slug, j['id'], norm(slug).title(), j.get('title',''),
                      j.get('location',{}).get('name',''), j.get('absolute_url',''), (j.get('updated_at') or '')[:10])
-            for j in d.get('jobs', [])]
+            for j in _require_jobs(d, 'Greenhouse')]
 
 def fetch_lever(slug):
     d = get_json(f'https://api.lever.co/v0/postings/{slug}?mode=json')
@@ -98,7 +162,70 @@ def fetch_workable(slug):
                      (j.get('company') or {}).get('name', slug.title()), j.get('title',''),
                      f"{j.get('location',{}).get('city','')} {j.get('country','')}".strip(),
                      j.get('url','') or j.get('shortlink',''), (j.get('published') or '')[:10])
-            for j in d.get('jobs', [])]
+            for j in _require_jobs(d, 'Workable')]
+
+DIRECT_PORTALS = {'greenhouse', 'lever', 'workable'}
+DIRECT_FETCHERS = {
+    'greenhouse': fetch_greenhouse,
+    'lever': fetch_lever,
+    'workable': fetch_workable,
+}
+
+def direct_boards_from_registry(registry):
+    """Return unique direct-API boards from the persistent registry."""
+    boards = {}
+    for company, entry in registry.items():
+        portal = entry.get('portal') or ''
+        if ':' not in portal:
+            continue
+        source, slug = portal.split(':', 1)
+        if source in DIRECT_PORTALS and slug:
+            boards.setdefault((source, slug), company)
+    return [(source, slug, boards[(source, slug)]) for source, slug in sorted(boards)]
+
+def configured_direct_boards(registry):
+    """Registry boards plus bootstrap boards not registered yet, deduplicated."""
+    boards = {(source, slug): company for source, slug, company
+              in direct_boards_from_registry(registry)}
+    for slug in GREENHOUSE_BOARDS:
+        boards.setdefault(('greenhouse', slug), norm(slug).title())
+    for slug in LEVER_COMPANIES:
+        boards.setdefault(('lever', slug), norm(slug).title())
+    for slug in WORKABLE_ACCOUNTS:
+        boards.setdefault(('workable', slug), norm(slug).title())
+    return [(source, slug, boards[(source, slug)]) for source, slug in sorted(boards)]
+
+def target_jobs(jobs):
+    """Return Singapore, full-time graduate, target-domain jobs only."""
+    return [job for job in jobs if job['sg'] and job['grad'] and job['domain']]
+
+def scan_direct_boards(boards, seen, fetchers=None):
+    """Scan every registered direct ATS board once and identify new matches."""
+    fetchers = fetchers or DIRECT_FETCHERS
+    jobs, errors = [], []
+    with cf.ThreadPoolExecutor(10) as ex:
+        futures = {
+            ex.submit(fetchers[source], slug): (source, slug, company)
+            for source, slug, company in boards
+        }
+        for future in cf.as_completed(futures):
+            source, slug, company = futures[future]
+            try:
+                fetched = future.result()
+                for job in fetched:
+                    job['company'] = company
+                jobs.extend(fetched)
+            except Exception as exc:
+                errors.append(f'{source}/{slug}: {type(exc).__name__}')
+    hits = target_jobs(jobs)
+    new = [job for job in hits if job['id'] not in seen]
+    new.sort(key=lambda job: job['id'])
+    return {
+        'new': new,
+        'all_open_matching': len(hits),
+        'scanned': len(boards),
+        'errors': sorted(errors),
+    }
 
 # ---------- LinkedIn lead extraction (guest API, discovery only) ----------
 # LinkedIn is a LEAD ENGINE like MCF: never surface linkedin.com/jobs apply
@@ -142,35 +269,51 @@ def li_fetch(keyword, start=0):
     with urllib.request.urlopen(req, timeout=25) as r:
         return r.read().decode('utf-8', 'ignore')
 
+def validate_li_html(body, cards, start):
+    """Reject HTTP-200 auth walls and malformed guest-search responses."""
+    if not isinstance(body, str):
+        raise ValueError('LinkedIn response is not text')
+    lowered = body.lower()
+    blocked = ('authwall', 'sign in | linkedin', '/checkpoint/', 'captcha', 'challenge-page')
+    if any(marker in lowered for marker in blocked):
+        raise ValueError('LinkedIn returned a block/login page')
+    if not body.strip() and start == 0:
+        raise ValueError('LinkedIn returned an empty first page')
+    if body.strip() and not cards:
+        raise ValueError('LinkedIn returned malformed guest-search HTML')
+
 
 def fetch_linkedin_leads():
-    """Discover companies hiring from LinkedIn guest jobs. Returns (leads, raw_roles)."""
+    """Discover LinkedIn lead companies and return source errors explicitly."""
     leads = {}
-    roles = []
+    role_count = 0
+    errors = []
     seen = set()
     for kw in LI_QUERIES:
         for start in (0, 25):
             try:
                 html = li_fetch(kw, start)
-            except Exception:
+                cards = parse_li_cards(html)
+                validate_li_html(html, cards, start)
+            except Exception as exc:
+                errors.append(f'{kw}@{start}: {type(exc).__name__}')
                 continue
-            for jid, title, company, location, url in parse_li_cards(html):
+            for jid, title, company, _location, _url in cards:
                 if jid in seen:
                     continue
                 seen.add(jid)
                 if not title or not company:
                     continue
-                if not KEYWORDS.search(title) or not DOMAINS.search(title):
+                if not is_full_time_grad(title) or not DOMAINS.search(title):
                     continue
                 if re.search(r'\b(senior|principal|staff|director|head of|vp|manager)\b', title, re.I) \
                         and not re.search(r'junior|graduate|entry|associate', title, re.I):
                     continue
                 posted = time.strftime('%Y-%m-%d', time.gmtime())
                 _add_lead(leads, company, title, posted, source='linkedin')
-                roles.append({'id': f'linkedin:{jid}', 'source': 'linkedin', 'company': company,
-                              'title': title, 'location': location, 'url': url})
+                role_count += 1
             time.sleep(0.6)  # be gentle to LinkedIn
-    return leads, roles
+    return leads, role_count, errors
 
 
 # ---------- MCF lead extraction ----------
@@ -188,12 +331,11 @@ def _add_lead(leads, company, title, posted, source):
         e['posted_max'] = posted
 
 def mcf_search(q, page=0):
-    try:
-        d = get_json('https://api.mycareersfuture.gov.sg/v2/search?limit=100&page=%d' % page,
-                     data={'search': q, 'sortBy': []}, extra=MCF_HDRS)
-        return d.get('results', [])
-    except Exception:
-        return []
+    d = get_json('https://api.mycareersfuture.gov.sg/v2/search?limit=100&page=%d' % page,
+                 data={'search': q, 'sortBy': []}, extra=MCF_HDRS)
+    if not isinstance(d, dict) or not isinstance(d.get('results'), list):
+        raise ValueError('MCF response is missing a results list')
+    return d['results']
 
 def fetch_mcf_leads():
     """Return {(company): {roles:set, sample_title, posted}} from MCF matches."""
@@ -204,10 +346,17 @@ def fetch_mcf_leads():
         'robotics engineer junior', 'embedded engineer junior',
         'data analyst graduate', 'firmware engineer junior',
     ]
-    leads = {}
+    leads, errors = {}, []
     seen_uuids = set()
     with cf.ThreadPoolExecutor(6) as ex:
-        results = list(ex.map(lambda q: mcf_search(q, 0), queries))
+        futures = {ex.submit(mcf_search, query, 0): query for query in queries}
+        results = []
+        for future in cf.as_completed(futures):
+            query = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                errors.append(f'{query}: {type(exc).__name__}')
     for res in results:
         for j in res:
             uid = j.get('uuid')
@@ -218,7 +367,7 @@ def fetch_mcf_leads():
             desc = norm(j.get('description'))[:800]
             hay = title + ' ' + desc
             # must look entry-level AND in-domain; skip if it screams senior
-            if not KEYWORDS.search(title) or not DOMAINS.search(hay):
+            if not is_full_time_grad(title) or not DOMAINS.search(hay):
                 continue
             if re.search(r'\b(senior|principal|staff|director|head of|vp|manager)\b', title, re.I) and not re.search(r'junior|graduate|entry', title, re.I):
                 continue
@@ -227,7 +376,7 @@ def fetch_mcf_leads():
                 continue
             posted = ((j.get('metadata') or {}).get('originalPostingDate') or '')[:10]
             _add_lead(leads, company, title, posted, source='mcf')
-    return leads
+    return leads, sorted(errors)
 
 # ---------- portal resolution ----------
 def probe_ats(company):
@@ -254,39 +403,62 @@ def probe_ats(company):
                 return r
     return None
 
+def _lead_source(info):
+    return ','.join(sorted(info['sources'])) if info.get('sources') else 'unknown'
+
+def partition_registered_leads(leads, registry):
+    """Separate known-company leads so their saved careers pages are reused."""
+    registered, unregistered = [], {}
+    for company, info in leads.items():
+        registry_company, entry = cr.find_company(company, registry=registry)
+        if entry is None:
+            unregistered[company] = info
+            continue
+        registered.append({
+            'company': company,
+            'registry_company': registry_company,
+            'portal': entry.get('portal', ''),
+            'careers_url': entry.get('url', ''),
+            'roles': sorted(info['roles'])[:4],
+            'posted': info['posted_max'],
+            'count': info['count'],
+            'found_via': _lead_source(info),
+            '_last_attempted': (entry.get('last_attempted') or
+                                entry.get('last_checked') or
+                                entry.get('last_verified') or ''),
+        })
+    registered.sort(key=lambda row: (row['_last_attempted'], -row['count'], row['company']))
+    for row in registered:
+        row.pop('_last_attempted')
+    return registered, unregistered
+
+def collect_verified_ids(direct_new, resolved):
+    """Collect stable direct-portal IDs that should enter dedup state."""
+    ids = {job['id'] for job in direct_new if job.get('id')}
+    for company in resolved:
+        ids.update(job['id'] for job in company.get('own_portal_roles', [])
+                   if job.get('id'))
+    return ids
+
 def main():
     seen = load_seen()
-    errors = []
 
-    def run(fn, *a):
-        try:
-            return fn(*a)
-        except Exception as e:
-            errors.append(f'{fn.__name__}/{a[0] if a else ""}: {type(e).__name__}')
-            return []
-
-    # 1. curated boards
-    curated = []
-    with cf.ThreadPoolExecutor(10) as ex:
-        futs = {}
-        for s in GREENHOUSE_BOARDS:
-            futs[ex.submit(run, fetch_greenhouse, s)] = s
-        for s in LEVER_COMPANIES:
-            futs[ex.submit(run, fetch_lever, s)] = s
-        for s in WORKABLE_ACCOUNTS:
-            futs[ex.submit(run, fetch_workable, s)] = s
-        for f in cf.as_completed(futs):
-            curated.extend(f.result())
-
-    cur_hits = [j for j in curated if j['sg'] and j['grad'] and j['domain']]
-    cur_new = [j for j in cur_hits if j['id'] not in seen]
-    save_seen(seen | {j['id'] for j in cur_new})
+    # 1. scan every direct-API company in the persistent registry. The legacy
+    # lists are only bootstrap fallbacks for boards not registered yet.
+    registry = cr.load()
+    direct_boards = configured_direct_boards(registry)
+    direct_scan = scan_direct_boards(direct_boards, seen)
+    cur_new = direct_scan['new']
 
     # 2. MCF + LinkedIn lead engines -> merged leads
-    mcf_leads = run(fetch_mcf_leads) or {}
-    li_leads, li_roles = (run(fetch_linkedin_leads) or ({}, []))
-    if not isinstance(li_leads, dict):
-        li_leads, li_roles = {}, []
+    try:
+        mcf_leads, mcf_errors = fetch_mcf_leads()
+    except Exception as exc:
+        mcf_leads, mcf_errors = {}, [f'fetch_mcf_leads: {type(exc).__name__}']
+    try:
+        li_leads, li_role_count, linkedin_errors = fetch_linkedin_leads()
+    except Exception as exc:
+        li_leads, li_role_count, linkedin_errors = {}, 0, [f'fetch_linkedin_leads: {type(exc).__name__}']
     leads = {}
     for src_leads in (mcf_leads, li_leads):
         for co, e in src_leads.items():
@@ -297,44 +469,69 @@ def main():
             if e.get('posted_max', '') > t['posted_max']:
                 t['posted_max'] = e['posted_max']
 
-    def src_str(info):
-        return ','.join(sorted(info['sources'])) if info.get('sources') else 'mcf'
-
-    # 3. resolve top leads to their own portals (cap for runtime)
+    # 3. Known lead companies reuse their registered careers pages. Only new
+    # companies incur generic ATS-slug probes and manual careers lookup.
+    registered_leads, unregistered_leads = partition_registered_leads(leads, registry)
     resolved, unresolved = [], []
-    top = sorted(leads.items(), key=lambda kv: (-kv[1]['count'], kv[0]))[:25]
+    top = sorted(unregistered_leads.items(), key=lambda kv: (-kv[1]['count'], kv[0]))[:25]
     with cf.ThreadPoolExecutor(6) as ex:
         futs = {ex.submit(probe_ats, co): co for co, _ in top}
         for f in cf.as_completed(futs):
             co = futs[f]
-            info = leads[co]
+            info = unregistered_leads[co]
             r = f.result()
             if r:
                 src, slug, jobs = r
-                match = [j for j in jobs if j['sg'] and (j['grad'] or j['domain'])]
+                match = target_jobs(jobs)
                 if match:
                     resolved.append({'company': co, 'portal': f'{src}:{slug}',
-                                     'roles': sorted(info['roles'])[:4], 'found_via': src_str(info),
+                                     'roles': sorted(info['roles'])[:4], 'found_via': _lead_source(info),
                                      'own_portal_roles': [{'title': j['title'], 'url': j['url'], 'id': j['id']} for j in match[:6]]})
                     continue
             unresolved.append({'company': co, 'roles': sorted(info['roles'])[:4],
                                'posted': info['posted_max'], 'count': info['count'],
-                               'found_via': src_str(info)})
+                               'found_via': _lead_source(info)})
+
+    dedup_ids_to_commit = sorted(collect_verified_ids(cur_new, resolved))
+
+    # 4. Rotate through non-API registered portals. The cron agent renders and
+    # verifies these company pages, then calls careers_registry.record_check().
+    recurring_due = cr.due_for_check(
+        registry=registry, limit=10, interval_hours=24,
+        excluded_portals=DIRECT_PORTALS,
+    )
+    recurring_checks = [{
+        'company': company,
+        'portal': entry.get('portal', ''),
+        'careers_url': entry.get('url', ''),
+        'last_checked': entry.get('last_checked') or entry.get('last_verified'),
+        'roles_seen': entry.get('roles_seen') or [],
+    } for company, entry in recurring_due]
 
     print(json.dumps({
         'generated': time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime()),
         'curated': {
             'new': [{k: j[k] for k in ('id','company','title','location','url','updated','source')} for j in sorted(cur_new, key=lambda x: x['id'])],
-            'all_open_matching': len(cur_hits),
+            'all_open_matching': direct_scan['all_open_matching'],
+            'registered_boards_scanned': direct_scan['scanned'],
         },
         'mcf_leads_found': len(mcf_leads),
-        'linkedin_roles_seen': len(li_roles),
+        'linkedin_roles_seen': li_role_count,
         'linkedin_lead_companies': len(li_leads),
         'total_lead_companies': len(leads),
+        'registered_leads_to_verify': registered_leads,
         'resolved_to_own_portal': resolved,
         'needs_manual_careers_lookup': sorted(unresolved, key=lambda x: -x['count'])[:15],
-        'errors': errors[:8],
+        'registered_portals_due_for_recurring_check': recurring_checks,
+        'dedup_ids_to_commit_after_persist': dedup_ids_to_commit,
+        'direct_board_errors': direct_scan['errors'],
+        'mcf_errors': mcf_errors,
+        'linkedin_errors': linkedin_errors,
+        'errors': direct_scan['errors'] + mcf_errors + linkedin_errors,
     }, indent=1))
 
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == '--commit-seen':
+        print(commit_seen_file(sys.argv[2]))
+    else:
+        main()

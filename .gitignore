@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 node_modules/
 *.log
+*.lock
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 
 # --- Scratch data dumps (report/print artifacts, not source) ---
 *.html
